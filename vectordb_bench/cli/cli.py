@@ -192,6 +192,15 @@ def get_custom_case_config(parameters: dict) -> dict:
             "dataset_with_size_type": parameters["dataset_with_size_type"],
             "label_percentage": parameters["label_percentage"],
         }
+    elif parameters["case_type"] == "StreamingPerformanceCase":
+        custom_case_config = {
+            "dataset_with_size_type": parameters["dataset_with_size_type"],
+            "insert_rate": parameters["insert_rate"],
+            "search_stages": parameters["search_stages"],
+            "concurrencies": parameters["concurrencies"],
+            "optimize_after_write": parameters["optimize_after_write"],
+            "read_dur_after_write": parameters["read_dur_after_write"],
+        }
     return custom_case_config
 
 
@@ -439,7 +448,8 @@ class CommonTypedDict(TypedDict):
         str,
         click.option(
             "--dataset-with-size-type",
-            help="Dataset with size type for NewIntFilterPerformanceCase/LabelFilterPerformanceCase, you can use "
+            help="Dataset with size type for NewIntFilterPerformanceCase/LabelFilterPerformanceCase/"
+            "StreamingPerformanceCase, you can use "
             "Medium Cohere (768dim, 1M)|Large Cohere (768dim, 10M)|Medium Bioasq (1024dim, 1M)|"
             "Large Bioasq (1024dim, 10M)|Large OpenAI (1536dim, 5M)|Medium OpenAI (1536dim, 500K)",
             default="Medium Cohere (768dim, 1M)",
@@ -461,6 +471,58 @@ class CommonTypedDict(TypedDict):
             "--label-percentage",
             help="Filter rate for LabelFilterPerformanceCase",
             default=0.01,
+            show_default=True,
+        ),
+    ]
+    insert_rate: Annotated[
+        int,
+        click.option(
+            "--insert-rate",
+            type=int,
+            help="Insert rate in rows/s for StreamingPerformanceCase (rounded down to a multiple of NUM_PER_BATCH)",
+            default=500,
+            show_default=True,
+        ),
+    ]
+    search_stages: Annotated[
+        list[float],
+        click.option(
+            "--search-stages",
+            type=str,
+            help="Comma-separated list of insert ratios at which to run a streaming search "
+            "for StreamingPerformanceCase, e.g. 0.5,0.8",
+            default="0.5,0.8",
+            show_default=True,
+            callback=lambda *args: list(map(float, click_arg_split(*args))),
+        ),
+    ]
+    concurrencies: Annotated[
+        list[int],
+        click.option(
+            "--concurrencies",
+            type=str,
+            help="Comma-separated list of search concurrency levels for StreamingPerformanceCase, e.g. 5,10",
+            default="5,10",
+            show_default=True,
+            callback=lambda *args: list(map(int, click_arg_split(*args))),
+        ),
+    ]
+    optimize_after_write: Annotated[
+        bool,
+        click.option(
+            "--optimize-after-write/--skip-optimize-after-write",
+            help="Optimize the index and run a final search after all data is inserted (StreamingPerformanceCase)",
+            default=True,
+            show_default=True,
+        ),
+    ]
+    read_dur_after_write: Annotated[
+        int,
+        click.option(
+            "--read-dur-after-write",
+            type=int,
+            help="Duration in seconds of the search run after all data is inserted (StreamingPerformanceCase)",
+            default=30,
             show_default=True,
         ),
     ]
