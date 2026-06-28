@@ -124,7 +124,10 @@ export DATASET_LOCAL_DIR=/path/to/vectordb_dataset
 ## Step 4 — Run the streaming benchmark
 
 With GarnetServer running, start the benchmark from this repo. The example below
-matches the DiskANN wiki configuration (10M Cohere, 1000 inserts/sec):
+reproduces the
+[DiskANN wiki](https://github.com/microsoft/DiskANN/wiki/Perf:-Garnet-Providers-vs-other-Vector-DBs-(Zilliz,-Pinecone,-etc.))
+configuration: Wikipedia-10M + Cohere (768-dim), inserting 1000 vectors/sec while
+searching at every 10% of ingestion across concurrency levels 5/10/20.
 
 ```bash
 cd /path/to/VectorDBBench
@@ -133,8 +136,8 @@ uv run vectordbbench garnet \
   --case-type StreamingPerformanceCase \
   --dataset-with-size-type "Large Cohere (768dim, 10M)" \
   --insert-rate 1000 \
-  --search-stages 0.1,0.3,0.5,0.7,0.9 \
-  --concurrencies 10,30,60 \
+  --search-stages 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9 \
+  --concurrencies 5,10,20 \
   --max-degree 16 \
   --l-build 128 \
   --l-search 128 \
@@ -144,19 +147,45 @@ uv run vectordbbench garnet \
   --db-label stream-cohere10m
 ```
 
-Drop `DATASET_LOCAL_DIR` to download to the default location. The first run with
-`--drop-old` (the default) clears the `vs0` collection on the server first.
+`--search-stages` and `--concurrencies` above are also the defaults, so they can be
+omitted for a wiki-matching run. Drop `DATASET_LOCAL_DIR` to download to the
+default location. The first run with `--drop-old` (the default) clears the `vs0`
+collection on the server first.
 
 > **Tip:** add `--dry-run` to print the resolved task config and exit without
 > running — useful to confirm flags before a multi-hour run.
+
+### Matching the wiki configuration
+
+The wiki ("DiskANN3 + Garnet Providers v1.0.26") used Zilliz's VectorDBBench with
+its standard streaming settings on an Azure D32v6 VM. The reproduction settings:
+
+| Setting | Value | Source |
+| --- | --- | --- |
+| Dataset | Cohere 768-dim, 10M (Wikipedia + Cohere embeddings) | wiki text |
+| Distance metric | COSINE | set automatically from the Cohere dataset |
+| `--insert-rate` | `1000` rows/sec | wiki text ("inserts 1000 vector per sec") |
+| `--search-stages` | `0.1 … 0.9` (every 10%) | VectorDBBench streaming default; matches the graph x-axis (a point per 10%) |
+| `--concurrencies` | `5,10,20` | VectorDBBench streaming default |
+| `--optimize-after-write` | on | default; the graphs' dashed "110%" point is the post-optimize search |
+| `--read-dur-after-write` | `30` s | default |
+| `--k` | `100` | default |
+
+The graphs plot, per stage, the **max QPS** over the concurrency sweep, the serial
+**p99 latency**, and an **adjusted recall** (`raw_recall / fraction_inserted`).
+
+> The graph index parameters (`--max-degree`, `--l-build`, `--l-search`) are not
+> stated in the wiki; they are recall/QPS tuning knobs (see [Tuning notes](#tuning-notes)).
+> Absolute QPS also depends on hardware and the concurrency sweep, so it will differ
+> from the wiki's 32-vCPU VM.
 
 ### Streaming options
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--insert-rate` | `500` | Background insert rate in rows/sec (rounded down to a multiple of `NUM_PER_BATCH`). |
-| `--search-stages` | `0.5,0.8` | Insert ratios at which to run a search round (e.g. `0.1,0.3,...`). |
-| `--concurrencies` | `5,10` | Search concurrency levels swept at each stage. |
+| `--search-stages` | `0.1,0.2,…,0.9` | Insert ratios at which to run a search round. |
+| `--concurrencies` | `5,10,20` | Search concurrency levels swept at each stage. |
 | `--optimize-after-write` / `--skip-optimize-after-write` | on | Optimize the index and run a final search after all data is inserted. |
 | `--read-dur-after-write` | `30` | Duration (s) of the final search run after all inserts complete. |
 | `--dataset-with-size-type` | `Medium Cohere (768dim, 1M)` | Dataset + size. For 10M use `Large Cohere (768dim, 10M)`. |
@@ -165,6 +194,7 @@ Available datasets for `--dataset-with-size-type`: `Medium Cohere (768dim, 1M)`,
 `Large Cohere (768dim, 10M)`, `Medium Bioasq (1024dim, 1M)`,
 `Large Bioasq (1024dim, 10M)`, `Large OpenAI (1536dim, 5M)`,
 `Medium OpenAI (1536dim, 500K)`.
+
 
 ### Garnet index/search options
 
@@ -204,7 +234,7 @@ The runner logs each stage, e.g.:
 
 ```
 Serial search - 50% done, recall=0.4106, p99=0.005, p95=0.0042
-End search in concurrency 60: ... qps=15921.99, p99=0.0065s
+End search in concurrency 20: ... qps=..., p99=0.005s
 ```
 
 ---

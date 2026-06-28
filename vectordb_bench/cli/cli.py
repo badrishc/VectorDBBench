@@ -490,8 +490,8 @@ class CommonTypedDict(TypedDict):
             "--search-stages",
             type=str,
             help="Comma-separated list of insert ratios at which to run a streaming search "
-            "for StreamingPerformanceCase, e.g. 0.5,0.8",
-            default="0.5,0.8",
+            "for StreamingPerformanceCase, e.g. 0.1,0.2,0.3",
+            default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9",
             show_default=True,
             callback=lambda *args: list(map(float, click_arg_split(*args))),
         ),
@@ -501,8 +501,8 @@ class CommonTypedDict(TypedDict):
         click.option(
             "--concurrencies",
             type=str,
-            help="Comma-separated list of search concurrency levels for StreamingPerformanceCase, e.g. 5,10",
-            default="5,10",
+            help="Comma-separated list of search concurrency levels for StreamingPerformanceCase, e.g. 5,10,20",
+            default="5,10,20",
             show_default=True,
             callback=lambda *args: list(map(int, click_arg_split(*args))),
         ),
