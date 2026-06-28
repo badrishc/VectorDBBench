@@ -127,7 +127,7 @@ With GarnetServer running, start the benchmark from this repo. The example below
 reproduces the
 [DiskANN wiki](https://github.com/microsoft/DiskANN/wiki/Perf:-Garnet-Providers-vs-other-Vector-DBs-(Zilliz,-Pinecone,-etc.))
 configuration: Wikipedia-10M + Cohere (768-dim), inserting 1000 vectors/sec while
-searching at every 10% of ingestion across concurrency levels 5/10/20.
+searching at every 10% of ingestion across concurrency levels 5/10/20/60.
 
 ```bash
 cd /path/to/VectorDBBench
@@ -137,7 +137,7 @@ uv run vectordbbench garnet \
   --dataset-with-size-type "Large Cohere (768dim, 10M)" \
   --insert-rate 1000 \
   --search-stages 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9 \
-  --concurrencies 5,10,20 \
+  --concurrencies 5,10,20,60 \
   --max-degree 16 \
   --l-build 128 \
   --l-search 128 \
@@ -166,7 +166,7 @@ its standard streaming settings on an Azure D32v6 VM. The reproduction settings:
 | Distance metric | COSINE | set automatically from the Cohere dataset |
 | `--insert-rate` | `1000` rows/sec | wiki text ("inserts 1000 vector per sec") |
 | `--search-stages` | `0.1 … 0.9` (every 10%) | VectorDBBench streaming default; matches the graph x-axis (a point per 10%) |
-| `--concurrencies` | `5,10,20` | VectorDBBench streaming default |
+| `--concurrencies` | `5,10,20,60` | wiki uses `5,10,20`; `60` is added here to exercise higher concurrency on large (many-core) hosts |
 | `--optimize-after-write` | on | default; the graphs' dashed "110%" point is the post-optimize search |
 | `--read-dur-after-write` | `30` s | default |
 | `--k` | `100` | default |
@@ -185,7 +185,7 @@ The graphs plot, per stage, the **max QPS** over the concurrency sweep, the seri
 | --- | --- | --- |
 | `--insert-rate` | `500` | Background insert rate in rows/sec (rounded down to a multiple of `NUM_PER_BATCH`). |
 | `--search-stages` | `0.1,0.2,…,0.9` | Insert ratios at which to run a search round. |
-| `--concurrencies` | `5,10,20` | Search concurrency levels swept at each stage. |
+| `--concurrencies` | `5,10,20,60` | Search concurrency levels swept at each stage. |
 | `--optimize-after-write` / `--skip-optimize-after-write` | on | Optimize the index and run a final search after all data is inserted. |
 | `--read-dur-after-write` | `30` | Duration (s) of the final search run after all inserts complete. |
 | `--dataset-with-size-type` | `Medium Cohere (768dim, 1M)` | Dataset + size. For 10M use `Large Cohere (768dim, 10M)`. |

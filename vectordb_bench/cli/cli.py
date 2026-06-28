@@ -501,8 +501,8 @@ class CommonTypedDict(TypedDict):
         click.option(
             "--concurrencies",
             type=str,
-            help="Comma-separated list of search concurrency levels for StreamingPerformanceCase, e.g. 5,10,20",
-            default="5,10,20",
+            help="Comma-separated list of search concurrency levels for StreamingPerformanceCase, e.g. 5,10,20,60",
+            default="5,10,20,60",
             show_default=True,
             callback=lambda *args: list(map(int, click_arg_split(*args))),
         ),
