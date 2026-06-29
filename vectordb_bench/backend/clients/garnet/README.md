@@ -108,6 +108,35 @@ This caps only the **managed** heap; Garnet's native vector storage (log pages +
 index) is unaffected. Leave comfortable headroom (≈24–32 GiB) for network buffers
 and per-session state under high concurrency — too tight risks a managed OOM.
 
+### Optional: enable the read cache
+
+For a larger-than-memory run, records spill to disk and a cold query pays a disk
+read. The **read cache** keeps a separate, never-flushed, LRU copy of hot on-disk
+records in memory so repeated queries stay fast. It is most useful when `--memory`
+is smaller than the dataset.
+
+The read cache requires storage tiering (so there is a disk tier to read from):
+
+```bash
+dotnet main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
+  --port 6379 --bind 127.0.0.1 --enable-vector-set-preview \
+  --index 8g --memory 16g --page 16m \
+  --storage-tier --logdir /path/to/garnet-logs \
+  --readcache --readcache-memory 8g --readcache-page 16m
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--storage-tier` | Enable on-disk tiering (records evicted below `Log.HeadAddress` go to `--logdir`). Required for the read cache. |
+| `--logdir` | Directory for the on-disk hybrid-log segments. |
+| `--readcache` | Enable the read cache. Fails at startup without `--storage-tier`. |
+| `--readcache-memory` | Total read-cache size (inline + heap). Does not need to be a power of 2. |
+| `--readcache-page` | Read-cache page size (rounds down to a power of 2; min 512). |
+
+Confirm it is active and being populated via `INFO STORE` (see below): the
+`ReadCache.*` fields appear (not `N/A`), and `ReadCache.TailAddress` grows past
+`64` as on-disk records are read and cached.
+
 ---
 
 ## Step 3 — (Optional) Pre-stage the dataset
@@ -256,6 +285,63 @@ It contains per-stage lists: `st_search_stage_list`, `st_max_qps_list_list`,
 > so per-stage recall ramps up as more data is inserted and converges to the true
 > value at the 100% end-of-stream search. VectorDBBench's UI shows an
 > "adjusted recall" = `raw_recall / fraction_inserted`.
+
+---
+
+## Inspecting store state with INFO
+
+Garnet exposes store internals over the RESP `INFO` command (Redis-protocol
+compatible). Use any client; the examples use a Python one-liner.
+
+### `INFO STORE` — log addresses
+
+```bash
+uv run python -c "import redis; i=redis.Redis(port=6379, protocol=2).execute_command('INFO','STORE'); print('\n'.join(f'{k}={i[k]}' for k in i if k.startswith(('Log.','ReadCache.'))))"
+```
+
+The hybrid-log addresses describe where data lives (addresses are byte offsets; an
+empty store starts at `64`):
+
+| Field | Meaning |
+| --- | --- |
+| `Log.BeginAddress` | Oldest valid address. Advances when the log head is truncated. |
+| `Log.HeadAddress` | Below this, records are **on disk** (evicted). Equal to `BeginAddress` means nothing has been evicted. |
+| `Log.SafeReadOnlyAddress` | Boundary between the mutable region (above) and the read-only/immutable region (below). |
+| `Log.FlushedUntilAddress` | How far the log has been flushed to the disk tier. |
+| `Log.TailAddress` | Current append point ≈ total in-log data size. |
+| `ReadCache.*` | Same addresses for the read cache, or `N/A` when `--readcache` is off. |
+
+**Expected addresses:**
+
+- **Pure in-memory run:** `Log.HeadAddress == Log.BeginAddress == 64` (nothing
+  evicted to disk) and `Log.TailAddress` ≈ the data size. This is the check used in
+  the monitoring step above.
+- **Tiered run (`--storage-tier`):** `Log.HeadAddress > Log.BeginAddress` once the
+  log exceeds `--memory` and older records spill to disk.
+- **Read cache active:** `ReadCache.TailAddress > 64` and grows as on-disk records
+  are read and copied into the cache.
+
+### `INFO STOREHASHTABLE` — hash-table distribution
+
+This dumps the main-store hash-index distribution (the equivalent of Tsavorite's
+`DumpDistribution`). It scans the whole index, so it is **expensive and not
+returned by default** — request it explicitly:
+
+```bash
+uv run python -c "import redis; print(redis.Redis(port=6379, protocol=2).execute_command('INFO','STOREHASHTABLE'))"
+```
+
+Key fields for judging index health:
+
+- `Number of hash buckets` / `Size of each bucket` — index capacity (set by `--index`).
+- `Total distinct hash-table entry count` — number of occupied entries.
+- `Average #entries per hash bucket` — load factor; well below 1 means the index is
+  generously sized for the data.
+- `Histogram of #entries per bucket` — the collision distribution. A healthy,
+  well-sized index is dominated by buckets with `0` or `1` entries with a small tail;
+  many buckets with high entry counts indicate collisions / an undersized `--index`.
+- `Total entries in overflow buckets` — non-zero means buckets overflowed (raise
+  `--index` if this grows large).
 
 ---
 
