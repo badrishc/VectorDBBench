@@ -70,8 +70,7 @@ dotnet main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
   --enable-vector-set-preview \
   --index 8g \
   --memory 128g \
-  --page 64m \
-  --value-overflow-threshold 16k
+  --page 64m
 ```
 
 Flag rationale (for the 10M Cohere 768-dim, NOQUANT/FP32 dataset ≈ 31 GiB of data):
@@ -82,10 +81,13 @@ Flag rationale (for the 10M Cohere 768-dim, NOQUANT/FP32 dataset ≈ 31 GiB of d
 | `--index` | `8g` | Hash-index size. Sized above the working set so it is not the limit. 8 GiB is generous for 10M; `4g` also works. |
 | `--memory` | `128g` | Hybrid-log capacity. Must exceed the resident data (~31 GiB) so nothing spills. This is a **cap**, not an upfront allocation. |
 | `--page` | `64m` | Log page size. Large pages reduce page count for a big in-memory log. |
-| `--value-overflow-threshold` | `16k` | Keep the 3 KB FP32 vectors inline in the log record (no overflow allocations). |
 
 Adjust `--memory` / `--index` to your dataset size and available RAM. For the 1M
 dataset, `--index 2g --memory 16g` is plenty.
+
+> The default `--value-overflow-threshold` (`16k`) already keeps each 3 KB FP32
+> vector inline in the log page, so it does not need to be set here. Only raise it
+> if a single value would exceed 16 KB (e.g. FP32 vectors of dimension ≥ 4096).
 
 ### Optional: cap virtual memory (VSZ)
 
@@ -99,7 +101,7 @@ managed heap:
 # 32 GiB managed-heap hard limit (0x800000000 bytes)
 DOTNET_GCHeapHardLimit=0x800000000 \
   dotnet main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
-  --port 6379 --enable-vector-set-preview --index 8g --memory 128g --page 64m --value-overflow-threshold 16k
+  --port 6379 --enable-vector-set-preview --index 8g --memory 128g --page 64m
 ```
 
 This caps only the **managed** heap; Garnet's native vector storage (log pages +
@@ -269,3 +271,42 @@ It contains per-stage lists: `st_search_stage_list`, `st_max_qps_list_list`,
 - **Smaller smoke test:** swap `--dataset-with-size-type "Medium Cohere (768dim, 1M)"`,
   `--memory 16g --index 2g`, and lower `--search-stages` for a quick end-to-end
   validation.
+
+---
+
+## Revivification: reusing log space after dropping a set
+
+Garnet's hybrid log is append-only, so `DEL <set>` (drop) tombstones the records
+but does not reclaim their space in memory — a subsequent reload appends on top,
+doubling `Log.TailAddress`. [Revivification](https://github.com/microsoft/garnet/blob/main/website/docs/dev/tsavorite/reviv.md)
+reuses those tombstoned records' space, so an insert→drop→insert cycle keeps the
+tail roughly flat instead of growing.
+
+Vector records share the main store, and dropping a vector set background-deletes
+every underlying record, so they feed the revivification free list. The default
+`--reviv` bins (256 records each) are far too small for millions of vector
+records; use **custom bins** sized to the records, with large counts:
+
+```bash
+dotnet main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
+  --port 6379 --enable-vector-set-preview --index 8g --memory 128g --page 64m \
+  --reviv-bin-record-sizes 64,128,256,512,1024,2048,4096,8192 \
+  --reviv-bin-record-counts 12000000
+```
+
+- Bins span the vector record sizes: ~3 KB `FP32` full vectors land in the 4096
+  bin; adjacency lists, id maps, and attributes use the smaller bins.
+- The count must cover the records freed by a drop (~5 records/vector across
+  types). Use ~12,000,000 for 10M vectors; scale down for smaller sets.
+- Each free-list slot is 8 bytes, so 8 bins × 12M ≈ 768 MB of overhead.
+- Drop cleanup is asynchronous; wait for it to finish before reloading.
+
+Verify reuse via `Log.TailAddress`: load → drop → reload should grow it by a few
+percent (records below `Log.SafeReadOnlyAddress` stay immutable and are not
+revivified), versus ~2× without revivification.
+
+| Test | Tail after load 1 | After drop | After load 2 | reuse |
+| --- | --- | --- | --- | --- |
+| 1M, reviv on | 3.06 GiB | 3.07 GiB | 3.18 GiB | ~96% |
+| 1M, reviv off | 3.06 GiB | 3.07 GiB | 6.13 GiB | 0% (doubled) |
+
