@@ -17,7 +17,7 @@ evicted, and to compare the two Linux native‑device IO backends
 |---|--:|--:|--:|
 | **Recall@100** | 0.838 | **0.8393** | **0.8393** |
 | **Serial p99 latency** | 3.8 ms | 98 ms | 121 ms |
-| **Peak QPS** | **17,077** (C260) | 212 (C60) | 210 (C30) |
+| **Peak QPS** | **~17,000** (C220) | 212 (C60) | 210 (C30) |
 | **Peak read IOPS** | — | ~520K | ~508K |
 | **Peak read bandwidth** | — | ~1.6 GB/s | ~1.65 GB/s |
 
@@ -26,7 +26,7 @@ evicted, and to compare the two Linux native‑device IO backends
 - **Recall is preserved off disk** — 0.838 in‑memory vs 0.839 disk‑served
   (identical for both IO backends). Serving raw vectors from disk changes
   *speed*, not *which* neighbors are found.
-- Moving raw vectors to disk costs **~80× throughput** (17,077 → ~212 QPS) and
+- Moving raw vectors to disk costs **~80× throughput** (~17,000 → ~212 QPS) and
   **~25× serial latency** (3.8 → ~98 ms). The graph adjacency ("stub") stays
   memory‑resident; only the 3,072‑byte FP32 vectors are read from NVMe.
 - Both IO backends reach **~510K read IOPS / ~1.6 GB/s** — about **80 % of the
@@ -120,11 +120,14 @@ data. Confirms "cache the adjacency, read the raw vectors from disk."
 
 | Concurrency | 10 | 30 | 60 | 100 | 140 | 180 | 220 | 260 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| **QPS** | 2,477 | 8,057 | 13,361 | 15,389 | 16,895 | 16,951 | 17,059 | **17,077** |
-| **p99 (ms)** | 6.0 | 5.7 | 7.7 | 13.3 | 16.5 | 24.5 | 29.0 | 42.0 |
+| **QPS** | 2,477 | 8,057 | 13,361 | 15,389 | 16,895 | 16,951 | **17,059** | 17,077 |
+| **p99 (ms)** | 6.0 | 5.7 | 7.7 | 13.3 | 16.5 | 24.5 | **29.0** | 42.0 |
 
-QPS saturates the box at **~17,000 QPS** around C140–180; beyond that only p99
-grows. This is the CPU‑bound in‑memory ceiling for this host.
+QPS effectively saturates the box at **~17,000 QPS**: it is within ~1 % of the
+ceiling by **C140** (16,895) and first crosses 17,000 at **C220 (17,059 QPS @
+p99 29 ms)**. Pushing to C260 adds only **+18 QPS (+0.1 %)** while p99 jumps to
+42 ms (+45 %), so **C220 is the effective peak** — the lowest concurrency that
+delivers full throughput. This is the CPU‑bound in‑memory ceiling for this host.
 
 ### 2. Disk‑served concurrency sweep — libaio (O_DIRECT)
 
@@ -214,7 +217,7 @@ parallelism (wider beam), and run the client on a separate host.
 
 1. **Recall is unaffected by tiering.** 0.838 (memory) ≈ 0.839 (disk), identical
    for libaio and io_uring. Disk tiering trades latency/throughput, not accuracy.
-2. **Cost of serving raw vectors from disk:** ~80× lower QPS (17,077 → ~212) and
+2. **Cost of serving raw vectors from disk:** ~80× lower QPS (~17,000 → ~212) and
    ~25× higher serial latency (3.8 → ~98 ms) at these parameters.
 3. **The stub is tiny and stays hot.** Caching adjacency + id‑maps to memory
    added only 45 MiB (0.14 % of the data); the 30.9 GiB of raw vectors live on
