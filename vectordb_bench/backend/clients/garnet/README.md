@@ -18,9 +18,9 @@ it does not start one. So there are two processes:
 2. **vectordbbench** — the benchmark client (this repo), which loads the dataset
    and drives inserts + searches.
 
-> 📊 For measured results — **in‑memory vs disk‑tiered** vector search, the
-> **libaio vs io_uring** O_DIRECT comparison, and NVMe saturation analysis on
-> the 10M Cohere dataset — see **[BENCHMARK_RESULTS.md](./BENCHMARK_RESULTS.md)**.
+> 📊 For measured results — **in‑memory vs disk‑tiered** vector search
+> (libaio, O_DIRECT) and NVMe saturation analysis on the 10M Cohere dataset —
+> see **[BENCHMARK_RESULTS.md](./BENCHMARK_RESULTS.md)**.
 
 ---
 

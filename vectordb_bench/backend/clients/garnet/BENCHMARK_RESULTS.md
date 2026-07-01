@@ -5,9 +5,8 @@ This document reports a full set of VectorDBBench measurements for Garnet
 on the **Wikipedia‑10M + Cohere 768‑dim** dataset (`Performance768D10M`, COSINE).
 
 The goal is to quantify what happens when the same graph is served **entirely
-from memory** versus **served from disk** after the raw vectors have been
-evicted, and to compare the two Linux native‑device IO backends
-(**libaio** and **io_uring**) under O_DIRECT (OS page cache bypassed).
+from memory** versus **served from disk** (Linux native **O_DIRECT** device with
+libaio, OS page cache bypassed) after the raw vectors have been evicted.
 
 All runs use the same parameters: `max_degree=16`, `l_build=300`, `l_search=192`,
 `k=100`, and the concurrency sweep **5, 10, 20, 40, 60, 80, 120, 140**
@@ -17,27 +16,22 @@ All runs use the same parameters: `max_degree=16`, `l_build=300`, `l_search=192`
 
 ## TL;DR
 
-| Metric (10M, md=16, l_build=300, l_search=192, k=100) | In‑memory | Disk (libaio, O_DIRECT) | Disk (io_uring, O_DIRECT) |
-|---|--:|--:|--:|
-| **Recall@100** | 0.838 | **0.8393** | **0.8393** |
-| **Serial p99 latency** | 3.8 ms | 96 ms | 94 ms |
-| **Peak QPS** | **16,906** (C140) | 215 (C40) | 208 (C40) |
-| **Peak read IOPS** | — | ~519K | ~499K |
-| **Peak read bandwidth** | — | ~1.69 GB/s | ~1.63 GB/s |
+| Metric (10M, md=16, l_build=300, l_search=192, k=100) | In‑memory | Disk (libaio, O_DIRECT) |
+|---|--:|--:|
+| **Recall@100** | 0.838 | **0.8393** |
+| **Serial p99 latency** | 3.8 ms | 96 ms |
+| **Peak QPS** | **16,906** (C140) | 215 (C40) |
+| **Peak read IOPS** | — | ~519K |
+| **Peak read bandwidth** | — | ~1.69 GB/s |
 
 **Headlines**
 
-- **Recall is preserved off disk** — 0.838 in‑memory vs **0.8393** disk‑served,
-  *identical* for both IO backends. Serving raw vectors from disk changes
-  *speed*, not *which* neighbors are found.
+- **Recall is preserved off disk** — 0.838 in‑memory vs **0.8393** disk‑served.
+  Serving raw vectors from disk changes *speed*, not *which* neighbors are found.
 - Moving raw vectors to disk costs **~80× throughput** (16,906 → ~215 QPS) and
   **~25× serial latency** (3.8 → ~96 ms). The graph adjacency ("stub") stays
   memory‑resident; only the 3,072‑byte FP32 vectors are read from NVMe.
-- **libaio and io_uring are equivalent** where both are unconstrained (through
-  C40, identical QPS and recall). libaio holds throughput to higher client
-  concurrency on this single co‑located box; io_uring is more sensitive to
-  client/server CPU contention (see the note under the io_uring table).
-- Both backends reach **~500–519K read IOPS / ~1.6 GB/s** — about **80 % of the
+- The disk workload reaches **~519K read IOPS / ~1.7 GB/s** — about **80 % of the
   device's ceiling for this access pattern** (see [SSD saturation](#ssd-saturation-analysis)).
   The workload is **not** SSD‑bound; the limiter is DiskANN's per‑query serial
   IO chain plus co‑locating the client with the server on one box.
@@ -48,7 +42,7 @@ All runs use the same parameters: `max_degree=16`, `l_build=300`, `l_search=192`
 
 | | |
 |---|---|
-| **CPU** | 2× Intel Xeon Platinum 8380 — 80 physical cores / 160 threads (2 NUMA nodes) |
+| **CPU** | 2× Intel Xeon Platinum 8380 — 80 physical cores / 160 threads |
 | **RAM** | 503 GB |
 | **NVMe** | Dell Ent NVMe P5600 MU 3.2 TB (`/dev/nvme0n1`, mounted `/DATA2`, 512‑byte sectors) |
 | **Garnet** | `main` @ `f396fd257` (PR #1901 merged), .NET 10, Release build |
@@ -80,21 +74,21 @@ GarnetServer --enable-vector-set-preview \
   --index 1g --memory 64g --page 64m \
   --storage-tier --logdir /DATA2/badrishc/garnet_ckpt \
   --checkpointdir /DATA2/badrishc/garnet_ckpt \
-  --device-type Native --device-io-backend {Libaio|Uring} \
+  --device-type Native --device-io-backend Libaio \
   --device-completion-threads 16 \
   --enable-debug-command local --recover
 ```
 
 `--device-type Native` uses the Linux **O_DIRECT** device (bypasses the OS page
-cache), confirmed by `libnative_device.so` + `libaio.so` / `liburing.so` in
-`/proc/<pid>/maps`. To move the graph to disk after loading:
+cache), confirmed by `libnative_device.so` + `libaio.so` in `/proc/<pid>/maps`.
+To move the graph to disk after loading:
 
 ```
 DEBUG FLUSHANDEVICT      # requires --enable-debug-command local
 # -> OK head=<tail> tail=<tail>   (Head advances to Tail: all records evicted)
 ```
 
-**Methodology for the disk runs:** recover the 10M checkpoint → `FLUSHANDEVICT`
+**Methodology for the disk run:** recover the 10M checkpoint → `FLUSHANDEVICT`
 → a warm‑up pass (C60, discarded) to populate the in‑memory stub cache →
 then measure serial recall + the concurrency sweep. This reports **steady‑state
 (warm‑stub)** disk performance, the realistic production case.
@@ -156,78 +150,31 @@ device is saturated at C40 and extra client concurrency only deepens the queue.
 Peak device: **~519K read IOPS, ~1.69 GB/s, r_await 0.22 ms, QD ≈ 115, %util 100 %**
 (request size ≈ 3.3 KB = the FP32 vector).
 
-### 3. Disk‑served concurrency sweep — io_uring (O_DIRECT)
-
-`recall = 0.8393`, `ndcg = 0.8537`, `serial avg = 59 ms`, `p99 = 94 ms`, `p95 = 79 ms`.
-
-| Concurrency | 5 | 10 | 20 | 40 | 60 | 80 | 120† | 140† |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|
-| **QPS** | 73 | 123 | 181 | **208** | 183 | 144 | — | — |
-| **p99 (ms)** | 103 | 121 | 164 | 293 | 513 | 967 | — | — |
-| **p95 (ms)** | 85 | 98 | 134 | 237 | 429 | 805 | — | — |
-
-Peak **208 QPS @ C40**. io_uring is **identical to libaio through C20** and close
-at C40, then falls behind at C60–C80 (183 vs 211, 144 vs 209) with higher tail
-latency. Peak device: **~499K read IOPS, ~1.63 GB/s, r_await 0.21 ms, QD ≈ 104**.
-
-> † **C120/C140 not reported for io_uring.** On this single host the benchmark
-> client runs *C* separate processes (VectorDBBench uses a `ProcessPoolExecutor`)
-> alongside the server. At C120+, the client processes plus the server's threads
-> plus the 16 device‑completion threads oversubscribe the 160‑thread box, and
-> io_uring's more CPU‑active completion path starves the server of CPU (client
-> socket‑read timeouts). This is a **co‑location artifact**, not a database fault
-> — the server returns to normal the instant the client backs off — and it does
-> not affect libaio in the same range. A dedicated client host would be needed to
-> measure io_uring beyond C80 cleanly. NUMA‑pinning the server to one socket was
-> tried and rejected: isolating it to 80 cores cut disk throughput ~2.6× (cross‑
-> socket latency + fewer cores), so it is not representative of the normal
-> all‑cores deployment.
-
-### 4. libaio vs io_uring (disk‑served, O_DIRECT)
-
-| | libaio | io_uring |
-|---|--:|--:|
-| Recall@100 | 0.8393 | 0.8393 |
-| Serial p99 | 96 ms | 94 ms |
-| Peak QPS | 215 (C40) | 208 (C40) |
-| QPS at C60 / C80 | 211 / 209 | 183 / 144 |
-| Peak read IOPS | ~519K | ~499K |
-| Peak read BW | ~1.69 GB/s | ~1.63 GB/s |
-| Peak queue depth | ~115 | ~104 |
-
-**On this shared‑box setup the two backends are equivalent where the device, not
-the CPU, is the limit (≤ C40).** libaio sustains throughput to higher client
-concurrency; io_uring's busier completion path loses ground once the co‑located
-client and server contend for CPU. For a single co‑located host, **libaio is the
-more robust choice**; on a dedicated‑client deployment the two would likely
-converge.
-
 ---
 
 ## SSD saturation analysis
 
-Device ceiling measured with `fio` (O_DIRECT, 16 jobs, iodepth 64 ≈ QD 1024) on a
-20 GB file on `/dev/nvme0n1`:
+Device ceiling measured with `fio` (O_DIRECT, libaio, 16 jobs, iodepth 64 ≈ QD
+1024) on a 20 GB file on `/dev/nvme0n1`:
 
 | fio profile | IOPS | Bandwidth |
 |---|--:|--:|
 | 4 KB random read | **758K** | 3.06 GB/s |
 | 3,072 B random read, **4 KB‑aligned** (`ba=4096`) | **757K** | 2.33 GB/s |
-| 3,072 B random read, 512‑aligned (= Garnet's access) | **648K** (libaio) / 650K (io_uring) | 1.99 GB/s |
+| 3,072 B random read, 512‑aligned (= Garnet's access) | **648K** | 1.99 GB/s |
 
 **Reading the ceiling correctly.** The device's absolute random‑read ceiling is
 **~758K IOPS** (4 KB). Garnet's raw vectors are **3,072 bytes** and land at
 512‑byte alignment, so each random read **straddles the device's 4 KB NAND page**
 and the ceiling for *that access pattern* drops to **~648K IOPS** (a ~15 %
 alignment penalty — the same 3,072‑byte read, forced to 4 KB alignment, recovers
-the full 757K). The fio engine is irrelevant to the ceiling (648K libaio ≈ 650K
-io_uring), which mirrors the Garnet result.
+the full 757K).
 
-Garnet's disk‑served workload reaches **~500–519K IOPS**:
+Garnet's disk‑served workload reaches **~519K IOPS**:
 
 - **≈ 80 % of the size‑matched 648K ceiling** (≈ 68 % of the 758K 4 KB peak).
 - `%util = 100 %` on NVMe means "never idle," **not** "max IOPS" — the device
-  still has headroom at our achieved queue depth (~104–115 vs fio's 1024).
+  still has headroom at our achieved queue depth (~115 vs fio's 1024).
 - Raising `--device-completion-threads` from the default 4 to 16 made no
   difference to IOPS, so the completion‑drain path is not the limit.
 - The real limiter is DiskANN's **per‑query serial dependency chain** — each
@@ -245,21 +192,17 @@ a separate host would remove the co‑location CPU contention.
 
 ## Key conclusions
 
-1. **Recall is unaffected by tiering.** 0.838 (memory) ≈ 0.8393 (disk), identical
-   for libaio and io_uring. Disk tiering trades latency/throughput, not accuracy.
+1. **Recall is unaffected by tiering.** 0.838 (memory) ≈ 0.8393 (disk). Disk
+   tiering trades latency/throughput, not accuracy.
 2. **Cost of serving raw vectors from disk:** ~80× lower QPS (16,906 → ~215) and
    ~25× higher serial latency (3.8 → ~96 ms) at these parameters.
 3. **The stub is tiny and stays hot.** The adjacency + id‑map stubs actually
    touched by the query set occupy only ~20 MiB of RAM; the ~31 GiB of raw
    vectors live on NVMe and are read on demand.
-4. **~80 % of the NVMe's ceiling for this access pattern** is reached by both
-   backends; the workload is bounded by DiskANN's serial per‑query IO and
-   client/server co‑location, not by the SSD or the completion threads. The
-   device's absolute ceiling is ~758K IOPS; 3,072‑byte 512‑aligned reads cap at
-   ~648K, and Garnet reaches ~500–519K of that.
-5. **libaio ≥ io_uring on a co‑located box.** Identical where the device is the
-   limit (≤ C40); libaio sustains throughput to higher client concurrency while
-   io_uring is more sensitive to client/server CPU contention.
+4. **~80 % of the NVMe's ceiling for this access pattern.** The workload is
+   bounded by DiskANN's serial per‑query IO and client/server co‑location, not by
+   the SSD or the completion threads. The device's absolute ceiling is ~758K
+   IOPS; 3,072‑byte 512‑aligned reads cap at ~648K, and Garnet reaches ~519K of that.
 
 ---
 
