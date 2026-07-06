@@ -19,6 +19,17 @@ class GarnetTypedDict(CommonTypedDict):
     filter_scale: Annotated[
         int, click.option("--filter-scale", type=int, help="Adaptive filter scale factor", default=16)
     ]
+    quantization: Annotated[
+        str,
+        click.option(
+            "--quantization",
+            type=click.Choice(["NOQUANT", "Q8", "BIN"], case_sensitive=False),
+            help="Vector quantization: NOQUANT (raw FP32), Q8 (8-bit), or BIN (1-bit). "
+            "Q8/BIN keep the raw FP32 vector on disk for reranking and cache the small "
+            "quantized vector in memory for graph traversal.",
+            default="NOQUANT",
+        ),
+    ]
 
 
 @cli.command()
@@ -40,6 +51,7 @@ def Garnet(**parameters: Unpack[GarnetTypedDict]):
             l_build=parameters["l_build"],
             l_search=parameters["l_search"],
             filter_scale=parameters["filter_scale"],
+            quantization=parameters["quantization"].upper(),
         ),
         **parameters,
     )

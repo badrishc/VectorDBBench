@@ -115,7 +115,7 @@ class Garnet(VectorDB):
                         "FP32",
                         np.array(emb).astype(np.float32).tobytes(),
                         str(metadata[i]),
-                        "NOQUANT",
+                        self.case_config.index_param()["params"]["quantization"],
                         "EF",
                         self.case_config.index_param()["params"]["l_build"],
                         "SETATTR",

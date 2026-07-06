@@ -26,11 +26,16 @@ class GarnetDBCaseConfig(BaseModel, DBCaseConfig):
     l_build: int
     l_search: int
     filter_scale: int
+    quantization: str = "NOQUANT"
 
     def index_param(self) -> dict:
         return {
             "metric_type": self.metric_type.value if self.metric_type is not None else "",
-            "params": {"max_degree": self.max_degree, "l_build": self.l_build},
+            "params": {
+                "max_degree": self.max_degree,
+                "l_build": self.l_build,
+                "quantization": self.quantization,
+            },
         }
 
     def search_param(self) -> dict:
