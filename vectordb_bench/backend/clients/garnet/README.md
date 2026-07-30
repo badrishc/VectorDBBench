@@ -1,15 +1,19 @@
-# Running the Garnet streaming benchmark
+# Running Garnet vector-set benchmarks
 
-This document is a step-by-step guide to start a GarnetServer and run the
-VectorDBBench **streaming** benchmark against it from the command line (no
-browser/UI).
+This document is a step-by-step guide to start a GarnetServer and run
+VectorDBBench against it from the command line (no browser/UI). Two workflows are
+covered:
 
-The streaming case (`StreamingPerformanceCase`) inserts vectors at a fixed rate
-in the background while continuously measuring search **QPS**, **p99 latency**,
-and **recall** at successive ingestion checkpoints. This reproduces the workload
-behind the
-[DiskANN + Garnet perf comparison](https://github.com/microsoft/DiskANN/wiki/Perf:-Garnet-Providers-vs-other-Vector-DBs-(Zilliz,-Pinecone,-etc.))
-(Wikipedia-10M + Cohere 768-dim embeddings, 1000 inserts/sec).
+- **Streaming** (`StreamingPerformanceCase`) — insert at a fixed rate while
+  continuously measuring search **QPS**, **p99 latency**, and **recall** at
+  successive ingestion checkpoints (Steps 1–6 below). This reproduces the workload
+  behind the
+  [DiskANN + Garnet perf comparison](https://github.com/microsoft/DiskANN/wiki/Perf:-Garnet-Providers-vs-other-Vector-DBs-(Zilliz,-Pinecone,-etc.))
+  (Wikipedia-10M + Cohere 768-dim embeddings, 1000 inserts/sec).
+- **Static quantized** (`Performance768D10M`) — bulk-load the dataset once, then
+  compare **NOQUANT / Q8 / BIN** search served **in memory** vs **from the NVMe
+  storage tier** (after eviction). See
+  [Quantized in-memory vs disk-tiered benchmark](#quantized-in-memory-vs-disk-tiered-benchmark-static-load).
 
 VectorDBBench's Garnet client connects to an **already-running** GarnetServer —
 it does not start one. So there are two processes:
@@ -238,9 +242,15 @@ Available datasets for `--dataset-with-size-type`: `Medium Cohere (768dim, 1M)`,
 | `--max-degree` | *required* | Graph degree (`M`) used at build time. |
 | `--l-build` | `128` | Build-time search-list size (`EF` on `VADD`). |
 | `--l-search` | `15` | Query-time search-list size (`EF` on `VSIM`). Higher → better recall, lower QPS. |
+| `--quantization` | `NOQUANT` | Vector quantization: `NOQUANT` (raw FP32), `Q8` (8-bit), `BIN` (1-bit). `Q8`/`BIN` keep the raw FP32 vector for reranking and cache the small quantized vector in memory for graph traversal. See [the quantized benchmark](#quantized-in-memory-vs-disk-tiered-benchmark-static-load). |
 | `--filter-scale` | `16` | Adaptive filter scale factor (filtered search). |
 | `--host` / `--port` | `127.0.0.1` / `6379` | GarnetServer address. |
 | `--username` / `--password` | — | Optional auth. |
+
+Load throughput is set by `--load-concurrency` (a common VectorDBBench flag, not
+Garnet-specific): the number of parallel insert workers. Default is `min(cpu, 4)`;
+raising it to `32` roughly 6× the load rate on a many-core host (concurrent `VADD`
+to one set scales in memory — see the quantized benchmark's load step).
 
 ---
 
@@ -289,6 +299,191 @@ It contains per-stage lists: `st_search_stage_list`, `st_max_qps_list_list`,
 > so per-stage recall ramps up as more data is inserted and converges to the true
 > value at the 100% end-of-stream search. VectorDBBench's UI shows an
 > "adjusted recall" = `raw_recall / fraction_inserted`.
+
+---
+
+## Quantized in-memory vs disk-tiered benchmark (static load)
+
+This is the workflow for the **NOQUANT / Q8 / BIN** comparison and the
+in-memory-vs-disk study: bulk-load the whole dataset once, then measure search
+served **fully in memory** and **from the NVMe storage tier** (after the raw
+vectors are evicted). Unlike the streaming case it uses the static
+`Performance768D10M` case (bulk load, then a serial + concurrency search sweep).
+
+### Quantization modes
+
+`--quantization` selects how each vector is stored and used during traversal:
+
+| Mode | Graph-traversal vector | Raw FP32 (for rerank) | In-graph memory (768-dim) |
+| --- | --- | --- | --- |
+| `NOQUANT` | full FP32 (3072 B) | — (traversal uses it) | 3072 B |
+| `Q8` | 8-bit quantized (768 B) | kept | 768 B |
+| `BIN` | 1-bit (96 B) | kept | 96 B |
+
+Q8/BIN keep the compact quantized vector memory-resident for graph traversal and
+keep the raw FP32 for final reranking. Under storage tiering, Garnet's read policy
+**copies the quantized + adjacency "stub" records back into memory** (main-log
+tail; no read cache required) when they are read from disk, while the raw FP32 is
+served from disk. So a disk-tiered Q8/BIN graph traverses on memory-resident
+quantized vectors and only reads raw FP32 from disk for reranking.
+
+**What to expect** (10M Cohere, `M=16, l_build=300, l_search=192, k=100`, on the
+hardware in BENCHMARK_RESULTS.md): in memory, Q8 roughly **doubles** peak QPS vs
+NOQUANT at equal recall (cheaper 768 B distance computations). Served from disk,
+recall is preserved and the quantized vectors are confirmed resident, but per-query
+latency is currently dominated by the raw-FP32 disk reads — see the *reads/query*
+step below.
+
+### Step A — Start a disk-tiered server (native O_DIRECT)
+
+The raw vectors must be able to spill to the NVMe device, so start with storage
+tiering and the Linux **native O_DIRECT** device (bypasses the OS page cache).
+`--enable-debug-command local` is required for `DEBUG FLUSHANDEVICT`. Use a
+**separate `--logdir`/`--checkpointdir` per quantization mode** to keep them
+isolated.
+
+```bash
+LOGDIR=/path/to/garnet_bench_Q8            # per-mode directory on the NVMe
+dotnet ~/git/garnet/main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
+  --port 6379 --bind 127.0.0.1 --enable-vector-set-preview \
+  --index 2g --memory 64g --page 64m \
+  --storage-tier --logdir "$LOGDIR" --checkpointdir "$LOGDIR" \
+  --device-type Native --device-io-backend Libaio --device-completion-threads 16 \
+  --enable-debug-command local
+```
+
+`--memory 64g` holds the whole 10M dataset (raw FP32 ~31 GiB, + Q8 quantized
+~7.5 GiB, + graph) **in memory during load**, so nothing spills mid-load (a
+concurrent bulk load into a spilling set is not safe). Eviction to disk happens
+explicitly in Step C. `--index 2g` gives headroom for the extra quantized-vector
+keys Q8/BIN add.
+
+| Flag | Why |
+| --- | --- |
+| `--storage-tier` + `--logdir` | Enable the on-disk tier the raw vectors are evicted to. |
+| `--device-type Native` | Linux O_DIRECT device — bypasses the OS page cache so disk numbers are real. |
+| `--device-io-backend Libaio` | libaio backend (`Uring` also available). |
+| `--device-completion-threads 16` | IO-completion threads for the device. |
+| `--enable-debug-command local` | Enables `DEBUG FLUSHANDEVICT` (loopback only). |
+
+### Step B — Load (32 insert workers)
+
+Bulk-load with `--load-concurrency 32` (concurrent `VADD` to one set scales to
+~13–37 cores in memory; 32 workers ≈ 6× the default-4 rate → ~20–35 min for 10M).
+`--quantization` is set here at build time. Load only (skip search):
+
+```bash
+export DATASET_LOCAL_DIR=/path/to/vectordb_dataset      # pre-staged 10M (Step 3)
+uv run vectordbbench garnet \
+  --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+  --max-degree 16 --l-build 300 --l-search 192 --k 100 \
+  --quantization Q8 --load-concurrency 32 \
+  --skip-search-serial --skip-search-concurrent \
+  --db-label Q8_load
+```
+
+Watch load progress with `INFO STORE` (`Log.TailAddress` growing; `HeadAddress`
+stays `64` = in-memory). Run once per mode (`NOQUANT`, `Q8`, `BIN`) into its own
+`--logdir`.
+
+### Step C — Measure in memory
+
+Search only (`--skip-drop-old --skip-load`), serial (recall + p99) plus a
+concurrency sweep (QPS):
+
+```bash
+uv run vectordbbench garnet \
+  --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+  --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+  --skip-drop-old --skip-load \
+  --num-concurrency 5,10,20,40,60,80,120,140 --concurrency-duration 30 \
+  --db-label Q8_inmem
+```
+
+### Step D — Evict to disk, and verify the quantized vectors come back to memory
+
+Evict the log to the NVMe device, then confirm the quantized/adjacency stubs are
+copied **back** into the main-log tail as queries touch them. The resident bytes
+are `Log.TailAddress − Log.HeadAddress` (the raw FP32 stays below `HeadAddress` on
+disk):
+
+```bash
+info() { uv run python -c "import redis; i=redis.Redis(port=6379,protocol=2,socket_timeout=120).execute_command('INFO','STORE'); h=int(i['Log.HeadAddress']); t=int(i['Log.TailAddress']); print('resident(Tail-Head)=%.2fGB Head=%.2fGB Tail=%.2fGB' % ((t-h)/1e9,h/1e9,t/1e9))"; }
+
+# Evict everything to disk (Head advances to Tail)
+uv run python -c "import redis; print(redis.Redis(port=6379,protocol=2,socket_timeout=120).execute_command('DEBUG','FLUSHANDEVICT'))"
+info                       # right after evict: resident ≈ 0.00 GB
+```
+
+Then run a couple of **serial warm passes** and re-check `info` after each — the
+resident set grows from ~0 and stabilizes (e.g. ~1.3 GB for the 10M query set)
+as the quantized + adjacency stubs return to memory:
+
+```bash
+for p in 1 2 3; do
+  uv run vectordbbench garnet --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+    --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+    --skip-drop-old --skip-load --skip-search-concurrent --db-label Q8_warm$p
+  info                     # resident(Tail-Head) grows, then stabilizes
+done
+```
+
+### Step E — Measure from disk
+
+Once resident bytes have stabilized (cache warm), run the full serial +
+concurrency sweep exactly as Step C (add `iostat` if you want the device view):
+
+```bash
+uv run vectordbbench garnet \
+  --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+  --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+  --skip-drop-old --skip-load \
+  --num-concurrency 5,10,20,40,60,80,120,140 --concurrency-duration 30 \
+  --db-label Q8_disk
+```
+
+Recall matches the in-memory run (eviction changes *speed*, not *which* neighbors
+are found).
+
+### Step F — Disk reads per query (iostat)
+
+To see how much raw-FP32 disk traffic each query drives, run `iostat` alongside a
+single **serial** pass and integrate the read count over the pass:
+
+```bash
+iostat -x 2 100 /dev/nvme0n1 > /tmp/io.log 2>&1 &          # auto-stops after 200 s
+uv run vectordbbench garnet --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+  --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+  --skip-drop-old --skip-load --skip-search-concurrent --db-label Q8_io
+# reads/query = sum(r/s * 2s) over the active window / 1000 queries:
+python3 -c "print('reads/query ~ %.0f' % (sum(float(l.split()[1])*2 for l in open('/tmp/io.log') if 'nvme0n1' in l and float(l.split()[1])>50)/1000))"
+```
+
+`r/s` is column 2 of `iostat -x`; `rareq-sz` (column 7) is the average read size.
+`reads/query` scales with `--l-search` (the candidate/visited set), which is the
+main knob for the disk read volume.
+
+### Step G — Checkpoint & recover (skip the reload)
+
+Loading 10M takes ~20–35 min, so checkpoint a loaded/evicted graph and recover it
+later (also validates recovery parity). Take a foreground checkpoint (`SAVE`
+blocks until durable), then restart with `--recover` pointing at the same
+directory:
+
+```bash
+uv run python -c "import redis; print(redis.Redis(port=6379,protocol=2,socket_timeout=3600).execute_command('SAVE'))"
+# ... later, same flags as Step A PLUS --recover:
+dotnet ~/git/garnet/main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
+  --port 6379 --bind 127.0.0.1 --enable-vector-set-preview \
+  --index 2g --memory 64g --page 64m \
+  --storage-tier --logdir "$LOGDIR" --checkpointdir "$LOGDIR" \
+  --device-type Native --device-io-backend Libaio --device-completion-threads 16 \
+  --enable-debug-command local --recover
+```
+
+Recovery restores the graph + native index (no ~20–35 min rebuild). It is
+CPU-busy for a few minutes finalizing the index; `INFO STORE` may block until it
+settles. Recall after recover equals the pre-checkpoint value.
 
 ---
 
@@ -356,8 +551,11 @@ Key fields for judging index health:
   `--max-degree 16`: `l-search 128` → recall ≈ 0.77; `500` → ≈ 0.90; `800` → ≈ 0.92.
   A higher `--max-degree` shifts the whole frontier up but requires a rebuild.
 - **Memory footprint** (10M, NOQUANT/FP32): ~31 GiB data log + the provisioned
-  index ≈ ~39 GB RSS. Quantizing (the Garnet client currently uses `NOQUANT`)
-  would substantially reduce the per-vector cost.
+  index ≈ ~39 GB RSS. **Quantizing** (`--quantization Q8` or `BIN`) keeps a small
+  quantized vector (768 B for Q8, 96 B for BIN) memory-resident for traversal while
+  the raw FP32 stays available for reranking, and roughly doubles in-memory search
+  throughput at equal recall (see
+  [the quantized benchmark](#quantized-in-memory-vs-disk-tiered-benchmark-static-load)).
 - **Smaller smoke test:** swap `--dataset-with-size-type "Medium Cohere (768dim, 1M)"`,
   `--memory 16g --index 2g`, and lower `--search-stages` for a quick end-to-end
   validation.
