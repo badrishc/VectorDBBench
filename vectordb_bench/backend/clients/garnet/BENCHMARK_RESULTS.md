@@ -1,40 +1,49 @@
-# Garnet Vector Search — In‑Memory vs Disk‑Tiered Benchmark Results
+# Garnet Vector Search — Quantization and In-Memory vs Disk-Tiered Results
 
-This document reports a full set of VectorDBBench measurements for Garnet
-[Vector Sets](https://github.com/microsoft/garnet) (DiskANN graph index, **NOQUANT / FP32**)
-on the **Wikipedia‑10M + Cohere 768‑dim** dataset (`Performance768D10M`, COSINE).
+VectorDBBench measurements for Garnet [Vector Sets](https://github.com/microsoft/garnet)
+(DiskANN graph index) on the **Wikipedia-10M + Cohere 768-dim** dataset
+(`Performance768D10M`, COSINE).
 
-The goal is to quantify what happens when the same graph is served **entirely
-from memory** versus **served from disk** (Linux native **O_DIRECT** device with
-libaio, OS page cache bypassed) after the raw vectors have been evicted.
+Two axes are covered:
 
-All runs use the same parameters: `max_degree=16`, `l_build=300`, `l_search=192`,
-`k=100`, and the concurrency sweep **5, 10, 20, 40, 60, 80, 120, 140**
-(30 s per level). The client is co‑located with the server on a single host.
+1. **Quantization** — `NOQUANT` (raw FP32 traversal) vs **`Q8`** (8-bit quantized
+   traversal with FP32 rerank).
+2. **Tiering** — served **entirely from memory** vs **from the NVMe storage tier**
+   (Linux native **O_DIRECT** device, OS page cache bypassed) after the log has been
+   evicted.
+
+All runs use `max_degree=16`, `l_build=300`, `l_search=192`, `k=100`, 1,000 held-out
+query vectors, and the concurrency sweep **5, 10, 20, 40, 60, 80, 120, 140**
+(30 s per level). The client is co-located with the server on a single host.
+
+> **The headline result is the Q8 disk-tiered number.** It started at 86 ms/query and is
+> now **3.3 ms** — a **26x** improvement at unchanged recall — putting disk-tiered
+> serving within ~20 % of *in-memory* Q8 latency. See
+> [The Q8 disk-tiered optimization arc](#the-q8-disk-tiered-optimization-arc).
 
 ---
 
 ## TL;DR
 
-| Metric (10M, md=16, l_build=300, l_search=192, k=100) | In‑memory | Disk (libaio, O_DIRECT) |
-|---|--:|--:|
-| **Recall@100** | 0.838 | **0.8393** |
-| **Serial p99 latency** | 3.8 ms | 96 ms |
-| **Peak QPS** | **16,906** (C140) | 215 (C40) |
-| **Peak read IOPS** | — | ~519K |
-| **Peak read bandwidth** | — | ~1.69 GB/s |
+| Metric (10M, md=16, l_build=300, l_search=192, k=100) | NOQUANT in-mem | **Q8 in-mem** | NOQUANT disk | **Q8 disk (current)** |
+|---|--:|--:|--:|--:|
+| **Recall@100** | 0.8382 | 0.8408 | 0.8382 | **0.8408** |
+| **Serial avg latency** | 2.7 ms | ~2.7 ms | 84.5 ms | **3.3 ms** |
+| **Serial p99 latency** | 3.9 ms | 3.6 ms | 186 ms | **4.4 ms** |
+| **Peak QPS** | 17,259 (C140) | **33,597** (C120) | 223 (C40) | **2,821** (C20) |
+| **Disk reads / query** | — | — | ~1,100 | **193** |
 
 **Headlines**
 
-- **Recall is preserved off disk** — 0.838 in‑memory vs **0.8393** disk‑served.
-  Serving raw vectors from disk changes *speed*, not *which* neighbors are found.
-- Moving raw vectors to disk costs **~80× throughput** (16,906 → ~215 QPS) and
-  **~25× serial latency** (3.8 → ~96 ms). The graph adjacency ("stub") stays
-  memory‑resident; only the 3,072‑byte FP32 vectors are read from NVMe.
-- The disk workload reaches **~519K read IOPS / ~1.7 GB/s** — about **80 % of the
-  device's ceiling for this access pattern** (see [SSD saturation](#ssd-saturation-analysis)).
-  The workload is **not** SSD‑bound; the limiter is DiskANN's per‑query serial
-  IO chain plus co‑locating the client with the server on one box.
+- **Recall is identical across every tier and every optimization** — **0.8408** for Q8
+  in memory, on disk, and after checkpoint/recover. Everything below changed *speed only*.
+- **In memory, Q8 is a ~1.95x throughput win** over NOQUANT (33,597 vs 17,259 QPS) at
+  equal recall: the 768 B quantized distance computation is far cheaper than 3,072 B FP32.
+- **On disk, Q8 now delivers ~12.6x NOQUANT's throughput** (2,821 vs 223 QPS) and
+  **~26x lower latency than where Q8-on-disk started** (3.3 ms vs 86 ms).
+- **Disk-tiered Q8 latency is now near-memory**: 3.3 ms vs ~2.7 ms. The remaining
+  *throughput* gap (2.8K vs 33.6K QPS) is **purely NVMe IOPS**, not software — the device
+  runs at **584K IOPS / 100 % utilization** at the plateau.
 
 ---
 
@@ -42,172 +51,305 @@ All runs use the same parameters: `max_degree=16`, `l_build=300`, `l_search=192`
 
 | | |
 |---|---|
-| **CPU** | 2× Intel Xeon Platinum 8380 — 80 physical cores / 160 threads |
-| **RAM** | 503 GB |
-| **NVMe** | Dell Ent NVMe P5600 MU 3.2 TB (`/dev/nvme0n1`, mounted `/DATA2`, 512‑byte sectors) |
-| **Garnet** | `main` @ `f396fd257` (PR #1901 merged), .NET 10, Release build |
-| **Dataset** | Cohere `cohere_large_10m` (Wikipedia + Cohere 768‑dim), 44 GB, COSINE |
-| **Index** | DiskANN, NOQUANT (FP32); `max_degree=16`, `l_build=300`, `l_search=192`, `k=100` |
-| **Client** | VectorDBBench, `Performance768D10M`, co‑located on the same host |
+| **CPU** | 2x Intel Xeon Platinum 8380 — 80 physical cores / **160 threads** |
+| **RAM** | 503 GB (Garnet limited to `--memory 64g`) |
+| **NVMe** | Dell Ent NVMe P5600 MU U.2 3.2 TB (`/dev/nvme0n1`, mounted `/DATA2`, 512-byte sectors), **single drive** (no RAID) |
+| **Kernel** | Linux 6.8.0 (io_uring, incl. unprivileged SQPOLL) |
+| **Garnet** | `main` @ `71e34c133`, .NET 10 (SDK 10.0.302), Release build |
+| **DiskANN** | `diskann-garnet` **4.0.4** |
+| **Dataset** | Cohere `cohere_large_10m` (Wikipedia + Cohere 768-dim), 44 GB checkpoint, COSINE |
+| **Client** | VectorDBBench, `Performance768D10M`, co-located on the same host |
 
-Raw FP32 vector = 768 × 4 = **3,072 bytes** (stored inline; a single device read
-per vector, since `--value-overflow-threshold` default 16k > 3,072).
+Raw FP32 vector = 768 x 4 = **3,072 B** (record ~3,104 B with framing, fetched in a
+**single** sector-aligned device read). Q8 quantized vector = **768 B**.
 
 ---
 
-## Configuration
+## What `Q8` actually means here
 
-### In‑memory server (no storage tier)
+`Q8` is Redis-compatible **8-bit scalar quantization** (`VectorQuantType.Q8`). Vectors are
+**ingested as FP32** (`VADD <set> FP32 <bytes> <id> Q8 EF <l_build> M <md> ...`) and Garnet
+stores **both** representations:
 
-```
-GarnetServer --enable-vector-set-preview \
-  --index 1g --memory 64g --page 64m
-```
+| Representation | Size (768-dim) | Used for | Where it lives when disk-tiered |
+|---|--:|---|---|
+| **Quantized vector** (8-bit) | 768 B | graph traversal / candidate selection | **memory** (copied back on read) |
+| **Full vector** (FP32) | 3,072 B | final **rerank** of the candidate set | **disk** (read on demand) |
 
-Verified pure in‑memory: `Log.HeadAddress == Log.BeginAddress == 64` (no spill),
-so every vector is resident in the mutable log region. RSS ≈ 32 GB.
+This split is exactly why the disk-tiered path issues **~193 reads/query** at
+`l_search=192`: traversal is served entirely from memory, and only the FP32 rerank vectors
+hit NVMe. Search is `VSIM <set> FP32 <query> COUNT 100 EF 192`, **unfiltered**.
 
-### Disk‑tiered server (native O_DIRECT device)
+### Per-namespace read-copy (caching) policy
 
-```
-GarnetServer --enable-vector-set-preview \
-  --index 1g --memory 64g --page 64m \
-  --storage-tier --logdir /DATA2/badrishc/garnet_ckpt \
-  --checkpointdir /DATA2/badrishc/garnet_ckpt \
-  --device-type Native --device-io-backend Libaio \
-  --device-completion-threads 16 \
-  --enable-debug-command local --recover
-```
+On a disk read, each Vector-Set namespace is either copied back into memory (copy-to-tail on
+the main log — or into the read cache when `--read-cache` is enabled) or served from disk
+every time. From `libs/server/Resp/Vector/VectorManager.Callbacks.cs`:
 
-`--device-type Native` uses the Linux **O_DIRECT** device (bypasses the OS page
-cache), confirmed by `libnative_device.so` + `libaio.so` in `/proc/<pid>/maps`.
-To move the graph to disk after loading:
-
-```
-DEBUG FLUSHANDEVICT      # requires --enable-debug-command local
-# -> OK head=<tail> tail=<tail>   (Head advances to Tail: all records evicted)
-```
-
-**Methodology for the disk run:** recover the 10M checkpoint → `FLUSHANDEVICT`
-→ a warm‑up pass (C60, discarded) to populate the in‑memory stub cache →
-then measure serial recall + the concurrency sweep. This reports **steady‑state
-(warm‑stub)** disk performance, the realistic production case.
-
-### Caching policy (what stays in memory vs goes to disk)
-
-Garnet keeps the graph **stub** memory‑resident and serves only the bulk raw
-vectors from disk. On a disk read, each Vector‑Set namespace is either copied to
-the main‑log tail (cached) or left on disk:
-
-| Namespace | Record | Copied to memory on read? |
+| Namespace | Record | Copied back to memory on read? |
 |---|---|:--:|
-| 0 | **FullVector** (raw FP32, 3,072 B) | ✗ — served from disk each read |
-| 1 | NeighborList (adjacency) | ✓ cached |
-| 2 | QuantizedVector | ✓ cached |
-| 3 | Attributes | ✗ (only read by *filtered* search) |
-| 4 | Metadata | ✗ (set‑level lifecycle only) |
-| 5 | InternalIdMap | ✓ cached |
-| 6 | ExternalIdMap | ✓ cached |
+| 0 | **FullVector** (raw FP32, 3,072 B) | NO — **served from disk by design** (rerank only) |
+| 1 | NeighborList (adjacency) | YES — cached |
+| 2 | QuantizedVector | YES — cached |
+| 3 | Attributes | NO — served from disk (read only by *filtered* search) |
+| 4 | **Metadata** | YES — cached  <- **this was the bug; see Phase 1** |
+| 5 | InternalIdMap | YES — cached |
+| 6 | ExternalIdMap | YES — cached |
 
-This workload is **unfiltered**, so Attributes (ns 3) and Metadata (ns 4) are
-never read per query — they are intentionally not cached.
+> **Correction to earlier revisions of this document.** Metadata (ns 4) was previously
+> documented as "set-level lifecycle only," never read per query. That was **wrong**, and it
+> was the root cause of the original 86 ms Q8-disk result — see
+> [Phase 1](#phase-1--the-metadata-discovery).
 
-**Verified after the sweep:** `Log.HeadAddress` unchanged (all 10M raw vectors
-stay on disk) and the warm stub region (`Log.TailAddress − Log.HeadAddress`) was
-only ~20 MiB for this query set — the adjacency/id‑map stubs actually touched by
-beam search. Confirms "cache the adjacency, read the raw vectors from disk."
+---
+
+## The Q8 disk-tiered optimization arc
+
+Warm, steady-state, serial (1,000 queries), `l_search=192`, **recall 0.8408 at every step**:
+
+| Phase | Change | Serial avg | Serial p99 | Peak QPS | disk rd/q |
+|---|---|--:|--:|--:|--:|
+| 0 | Q8 on disk, as originally measured | 86 ms | 184 ms | ~223 | 386 |
+| 1 | **Cache the Metadata namespace** (copy-to-tail) | 46.5 ms | 80.7 ms | 1,142 | **193** |
+| 2 | **DiskANN 4.0.4** — batched (single multi-read) rerank | 5.0 ms | 6.1 ms | 2,417 | 193 |
+| 3 | **io_uring + device IOPS work** (garnet #2018) | 4.1 ms | 5.2 ms | 2,755 | 193 |
+| 4 | **+ `--device-uring-sqpoll`** | **3.3 ms** | **4.4 ms** | 2,798 | 193 |
+| 4b | + `--device-throttle-limit 512` (tuning check) | 3.3 ms | 4.6 ms | **2,821** | 193 |
+
+**Net: 86 ms -> 3.3 ms (26x) and 223 -> 2,821 QPS (12.6x), recall unchanged at 0.8408.**
+
+### Phase 1 — the Metadata discovery
+
+**86 ms -> 46.5 ms.** Per-namespace read instrumentation (counting vector read-callback invocations by
+`NamespaceBytes[0] & 7`, split `DiskLogRecord` vs in-memory `LogRecord`) on a warm pass:
+
+| namespace | disk rd/q | mem rd/q | disk KB/q | avg read |
+|---|--:|--:|--:|--:|
+| QuantizedVector (2) | 0 | 2,117 | 0 | — (cached) |
+| NeighborList (1) | 0 | 215 | 0 | — (cached) |
+| ExternalIdMap (6) | 0 | 100 | 0 | — (cached) |
+| FullVector (0) | 193 | 0 | 594 | 3,076 B |
+| **Metadata (4)** | **193** | 0 | **1,582** | **8,196 B** |
+| **TOTAL disk** | **386** | | **2,176** | |
+
+Traversal was already 100 % in memory — the quantization design worked as intended. But
+**Metadata, an 8 KB record, was being read once per rerank candidate, uncached, accounting
+for 73 % of all disk bytes/query** — more than the vectors themselves.
+
+A cold pass proved it is a small *shared* structure, not per-node data:
+`disk=154, mem=193154` (~154 unique records re-read ~193x/query), versus FullVector's
+genuinely per-node `disk=193001, mem=0`.
+
+**Fix:** add `DiskANNService.Metadata` to the copy-to-tail `ReadCopyOptions` branch — a
+few-line change that removed **73 % of disk bytes/query** for ~1.3 MB of memory. Merged
+upstream as **microsoft/garnet#2007**.
+
+### Phase 2 — DiskANN 4.0.4 batched rerank (46.5 -> 5.0 ms)
+
+With Metadata cached, the remaining 193 FullVector reads were still issued **serially per
+query**, so the NVMe sat at queue depth ~1-30 while CPU was ~60 % idle — the workload was
+*IO-parallelism-bound*, not device-bound. DiskANN **4.0.4** issues the rerank set as a
+**single multi-read**, taking serial-pass queue depth to ~24 and latency **46.5 -> 5.0 ms
+(~9x)**, and peak QPS to 2,417. Throughput then became **device-IOPS-bound**.
+
+### Phase 3 — device IOPS work (5.0 -> 4.1 ms)
+
+garnet **#2018 "[Storage] Optimize IOPS for RAID-0 NVMe disks"** reworked the native device
+(ring sharding, deeper defaults) and shipped new tuning flags. On `main` with plain io_uring
+at **default** parameters this gives 4.1 ms / 2,755 QPS — the new defaults match or beat the
+previously hand-tuned configuration, so **no tuning is required**.
+
+### Phase 4 — io_uring SQPOLL (4.1 -> 3.3 ms)
+
+A microsecond-level breakdown of the per-read cost on the serial path found **7.43 us/read**,
+of which **6.06 us (82 %) was the P/Invoke + native submit**; within that, the
+`io_uring_submit` **syscall alone was 5.03 us**. For O_DIRECT NVMe reads the kernel performs
+block-layer submission *inline* in `io_uring_enter`, once per read — so this was
+CPU-in-syscall time, **not** IO wait (the device-throttle spin measured only 0.17 us,
+proving the drive was idle).
+
+`IORING_SETUP_SQPOLL` moves submission to a kernel poller thread, making submits
+syscall-free. Enabled with **`--device-uring-sqpoll`** (shipped in #2018; 64 rings -> 64
+`iou-sqp` kernel threads):
+
+| | default submit | **SQPOLL** | delta |
+|---|--:|--:|--:|
+| serial avg | 4.1 ms | **3.3 ms** | **-19 %** |
+| serial p99 | 5.2 ms | **4.4 ms** | -15 % |
+| QPS @ C5 | 1,198 | 1,301 | +9 % |
+| QPS @ C10 | 1,970 | 2,257 | **+15 %** |
+| peak QPS | 2,755 | 2,798 | ~0 % (device-bound) |
+
+**SQPOLL is a latency / low-concurrency optimization only.** At the plateau the device is
+already saturated, so submission cost is irrelevant; the busy-polling threads even cost a
+little p99 at C120-140. That is why the flag is **opt-in**.
 
 ---
 
 ## Results
 
-### 1. In‑memory concurrency sweep
-
-`recall = 0.838`, `serial p99 = 3.8 ms`, `p95 = 3.3 ms`, pure in‑memory.
+### 1. In-memory concurrency sweep (QPS)
 
 | Concurrency | 5 | 10 | 20 | 40 | 60 | 80 | 120 | 140 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| **QPS** | 1,345 | 2,474 | 5,478 | 10,054 | 13,359 | 14,748 | 16,526 | **16,906** |
-| **p99 (ms)** | 5.6 | 5.8 | 5.3 | 6.0 | 7.4 | 9.8 | 14.5 | 15.9 |
+| **NOQUANT** (recall 0.8382) | 1,368 | 2,539 | 5,472 | 10,890 | 12,927 | 15,075 | 16,774 | **17,259** |
+| **Q8** (recall 0.8408) | 1,113 | 2,217 | 4,337 | 11,437 | 15,864 | 20,246 | **33,597** | 32,326 |
 
-Throughput scales almost linearly to C40 (~10k QPS) and reaches the **knee at
-C140 = 16,906 QPS** (p99 15.9 ms), the CPU‑bound in‑memory ceiling for this host.
-(A wider sweep in earlier testing confirmed the plateau: C220 ≈ 17,059 and C260 ≈
-17,077 add only ~1 % QPS for +2–3× the p99, so C140 is the effective peak.)
+NOQUANT peaks at C140 = **17,259 QPS**; Q8 peaks at C120 = **33,597 QPS** (**1.95x**). Below
+C20 NOQUANT is slightly ahead — quantization adds a rerank step that only pays off once the
+cheaper distance math dominates — after which Q8 pulls away decisively.
 
-### 2. Disk‑served concurrency sweep — libaio (O_DIRECT)
-
-`recall = 0.8393`, `ndcg = 0.8537`, `serial avg = 60.6 ms`, `p99 = 96 ms`, `p95 = 84 ms`.
+### 2. Disk-tiered concurrency sweep (QPS), current `main`
 
 | Concurrency | 5 | 10 | 20 | 40 | 60 | 80 | 120 | 140 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| **QPS** | 71 | 121 | 181 | **215** | 211 | 209 | 197 | 189 |
-| **p99 (ms)** | 108 | 125 | 165 | 278 | 441 | 584 | 919 | 1151 |
-| **p95 (ms)** | 88 | 101 | 134 | 229 | 357 | 504 | 781 | 932 |
+| **NOQUANT** (recall 0.8382) | 78 | 132 | 192 | **223** | 219 | 217 | 205 | 196 |
+| **Q8**, io_uring default (0.8408) | 1,198 | 1,970 | **2,755** | 2,750 | 2,739 | 2,728 | 2,721 | 2,714 |
+| **Q8**, + SQPOLL (0.8408) | 1,301 | 2,257 | **2,798** | 2,780 | 2,767 | 2,757 | 2,749 | 2,739 |
+| **Q8**, + SQPOLL + throttle 512 | 1,283 | 2,251 | **2,821** | 2,792 | 2,773 | 2,763 | 2,755 | 2,740 |
 
-Peak **215 QPS @ C40**, then a gentle, graceful decline as latency climbs — the
-device is saturated at C40 and extra client concurrency only deepens the queue.
-Peak device: **~519K read IOPS, ~1.69 GB/s, r_await 0.22 ms, QD ≈ 115, %util 100 %**
-(request size ≈ 3.3 KB = the FP32 vector).
+Q8 average latency by concurrency (SQPOLL): 3.8 / 4.4 / 7.1 / 14.4 / 21.6 / 29.0 / 43.5 /
+51.0 ms.
+
+The Q8 curve **saturates at C20 and then stays flat** out to C140 — the signature of a
+device-IOPS ceiling rather than a software collapse. NOQUANT-on-disk is ~12.6x slower
+because it must read a 3,072 B FP32 vector *at every hop of the traversal*, not just for
+rerank.
+
+### 3. Why `l_search` sets the disk ceiling
+
+With Metadata cached, FullVector rerank reads are the *only* disk cost, so throughput
+follows a clean relationship (measured on the Phase-1 build):
+
+> **peak_QPS ~= device_IOPS_ceiling / reads_per_query**, where
+> **reads/query = max(k, l_search)**
+
+| l_search | recall | FullVector rd/q | peak QPS | ~ device IOPS |
+|--:|--:|--:|--:|--:|
+| 32 | 0.7548 | 101 | 2,203 | 222K |
+| 64 | 0.7548 | 101 | 2,243 | 227K |
+| 128 | 0.7927 | 129 | 1,747 | 225K |
+| 192 | 0.8408 | 193 | 1,162 | 224K |
+| 256 | 0.8684 | 257 | 859 | 221K |
+
+`peak_QPS x reads/q` is nearly constant, confirming the model. (l_search 32 ~= 64 because
+both floor at ~101 reads/q — `k=100` dominates the rerank set.)
 
 ---
 
-## SSD saturation analysis
+## Device saturation analysis
 
-Device ceiling measured with `fio` (O_DIRECT, libaio, 16 jobs, iodepth 64 ≈ QD
-1024) on a 20 GB file on `/dev/nvme0n1`:
+`iostat -x` during the C40 Q8 disk sweep on current `main` (steady-state samples):
+
+| metric | value |
+|---|--:|
+| r/s | **584,226** |
+| read bandwidth | 1.96 GB/s |
+| avg read size | 3.36 KB (= the FP32 record, single IO) |
+| avg queue depth (`aqu-sz`) | 2,390 |
+| `r_await` | 4.10 ms |
+| `%util` | **100 %** |
+| w/s | 0 |
+
+Device ceiling measured independently with `fio` (O_DIRECT, 16 jobs, iodepth 64):
 
 | fio profile | IOPS | Bandwidth |
 |---|--:|--:|
 | 4 KB random read | **758K** | 3.06 GB/s |
-| 3,072 B random read, **4 KB‑aligned** (`ba=4096`) | **757K** | 2.33 GB/s |
-| 3,072 B random read, 512‑aligned (= Garnet's access) | **648K** | 1.99 GB/s |
+| 3,072 B random read, **4 KB-aligned** (`ba=4096`) | 757K | 2.33 GB/s |
+| 3,072 B random read, 512-aligned (= Garnet's access) | **648K** | 1.99 GB/s |
 
-**Reading the ceiling correctly.** The device's absolute random‑read ceiling is
-**~758K IOPS** (4 KB). Garnet's raw vectors are **3,072 bytes** and land at
-512‑byte alignment, so each random read **straddles the device's 4 KB NAND page**
-and the ceiling for *that access pattern* drops to **~648K IOPS** (a ~15 %
-alignment penalty — the same 3,072‑byte read, forced to 4 KB alignment, recovers
-the full 757K).
+Garnet's 3,072 B vectors land at 512-byte alignment, so each read straddles the device's
+4 KB NAND page and the ceiling for *that* access pattern is **~648K IOPS** (a ~15 %
+alignment penalty; the same read forced to 4 KB alignment recovers the full 757K).
 
-Garnet's disk‑served workload reaches **~519K IOPS**:
+At **584K IOPS** the workload now sits at **~90 % of that size-and-alignment-matched
+ceiling** — up from ~35 % before the optimization arc. Throughput is genuinely
+**NVMe-bound**: no software change lifts the plateau, only fewer reads per query or more
+devices.
 
-- **≈ 80 % of the size‑matched 648K ceiling** (≈ 68 % of the 758K 4 KB peak).
-- `%util = 100 %` on NVMe means "never idle," **not** "max IOPS" — the device
-  still has headroom at our achieved queue depth (~115 vs fio's 1024).
-- Raising `--device-completion-threads` from the default 4 to 16 made no
-  difference to IOPS, so the completion‑drain path is not the limit.
-- The real limiter is DiskANN's **per‑query serial dependency chain** — each
-  query issues on the order of a thousand mostly‑sequential vector reads
-  (`l_search=192`), giving low per‑query IO parallelism — compounded by the
-  benchmark client sharing the 160‑thread box with the server.
-
-**Actionable:** 4 KB‑aligning (or padding) the stored vectors would lift the
-per‑read device ceiling ~648K → ~758K (≈ 15 % more IOPS headroom). Reducing reads
-per query (quantization / a hot‑vector read cache) or adding per‑query IO
-parallelism (wider beam) would push closer to that ceiling; running the client on
-a separate host would remove the co‑location CPU contention.
+`--device-throttle-limit 512` vs the new default 4096 changed nothing beyond noise
+(2,821 vs 2,798 peak), confirming the deeper default is harmless even though it drives
+queue depth to ~2,390.
 
 ---
 
 ## Key conclusions
 
-1. **Recall is unaffected by tiering.** 0.838 (memory) ≈ 0.8393 (disk). Disk
-   tiering trades latency/throughput, not accuracy.
-2. **Cost of serving raw vectors from disk:** ~80× lower QPS (16,906 → ~215) and
-   ~25× higher serial latency (3.8 → ~96 ms) at these parameters.
-3. **The stub is tiny and stays hot.** The adjacency + id‑map stubs actually
-   touched by the query set occupy only ~20 MiB of RAM; the ~31 GiB of raw
-   vectors live on NVMe and are read on demand.
-4. **~80 % of the NVMe's ceiling for this access pattern.** The workload is
-   bounded by DiskANN's serial per‑query IO and client/server co‑location, not by
-   the SSD or the completion threads. The device's absolute ceiling is ~758K
-   IOPS; 3,072‑byte 512‑aligned reads cap at ~648K, and Garnet reaches ~519K of that.
+1. **Recall is invariant** — 0.8408 for Q8 across in-memory, disk-tiered, post-recover, and
+   every optimization phase. Tiering and quantization trade speed, not accuracy.
+2. **Q8 in memory ~= 2x NOQUANT** (33,597 vs 17,259 QPS) at equal recall.
+3. **Q8 disk-tiered latency is now near-memory**: 3.3 ms vs ~2.7 ms in-memory — a 26x
+   improvement over the original 86 ms, from four independent fixes (Metadata caching,
+   batched rerank, device IOPS work, SQPOLL).
+4. **Disk throughput is now genuinely device-bound** at 584K IOPS / 100 % util (~90 % of
+   the drive's size-matched ceiling). The path to higher QPS is **fewer reads per query**
+   (a shallower rerank depth R << l_search, or an fp16 in-memory rerank surrogate at
+   ~15 GB) or **more NVMe devices** (RAID-0, which #2018 explicitly targets) — *not* more
+   IO tuning. 4 KB-aligning the stored vectors would also lift the per-read ceiling
+   ~648K -> ~758K.
+5. **Defaults are good now.** The #2018 device defaults match or beat the previously
+   hand-tuned settings; only `--device-uring-sqpoll` is worth opting into, and only for
+   latency-sensitive / low-concurrency serving.
+
+### Open question
+
+During the `iostat` window the device served **584,226 r/s** against **2,734.8 QPS**, i.e.
+**~214 device reads per query**, versus the **193** logical FullVector reads instrumented at
+`l_search=192` (~11 % more). The earlier Phase-1/2 builds tracked ~193 closely. Worth
+re-running the per-namespace instrumentation on current `main` to confirm no extra IO crept
+in with the newer storage changes (garnet #2062 record framing / #2063 buffer pool are the
+likeliest candidates).
 
 ---
 
-*Reproduce with the disk‑tiered configuration above, then run
-`vectordbbench garnet --case-type Performance768D10M --max-degree 16
---l-build 300 --l-search 192 --k 100 --skip-drop-old --skip-load
---num-concurrency 5,10,20,40,60,80,120,140`. See [README.md](./README.md) for the
-full build‑and‑run walkthrough.*
+## Reproduction
+
+Full step-by-step build/load/measure instructions are in
+[README.md](./README.md#quantized-in-memory-vs-disk-tiered-benchmark-static-load).
+Condensed, assuming an already loaded + checkpointed 10M Q8 index:
+
+```bash
+# 1. Start the disk-tiered server, recovering the existing checkpoint
+LOGDIR=/DATA2/badrishc/garnet_bench_Q8
+dotnet ~/git/garnet/main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
+  --port 6379 --bind 127.0.0.1 --enable-vector-set-preview \
+  --index 2g --memory 64g --page 64m \
+  --storage-tier --logdir "$LOGDIR" --checkpointdir "$LOGDIR" \
+  --device-type Native --device-io-backend Uring \
+  --device-uring-sqpoll \
+  --enable-debug-command local --recover
+# Recovery blocks ~1-2 min; poll DBSIZE until it returns.
+
+# 2. Force disk serving: evict the whole log (Head advances to Tail)
+redis-cli DEBUG FLUSHANDEVICT          # -> OK head=<tail> tail=<tail>
+
+# 3. One cold pass to rehydrate the graph stubs (~32 ms/query; discard)
+export DATASET_LOCAL_DIR=/path/to/vectordb_dataset
+uv run vectordbbench garnet --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+  --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+  --skip-drop-old --skip-load --skip-search-concurrent --db-label cold
+
+# 4. Warm serial passes (recall + latency); stable by pass 2-3
+for i in 1 2 3; do
+  uv run vectordbbench garnet --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+    --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+    --skip-drop-old --skip-load --skip-search-concurrent --db-label warm$i
+done
+
+# 5. Concurrency sweep (QPS)
+uv run vectordbbench garnet --case-type Performance768D10M --host 127.0.0.1 --port 6379 \
+  --max-degree 16 --l-build 300 --l-search 192 --k 100 --quantization Q8 \
+  --skip-drop-old --skip-load --skip-search-serial \
+  --num-concurrency 5,10,20,40,60,80,120,140 --concurrency-duration 30 --db-label sweep
+
+# 6. Device view (run alongside step 5)
+iostat -x 5 /dev/nvme0n1       # watch r/s, rareq-sz, aqu-sz, r_await, %util
+```
+
+**Expected on the hardware above:** cold pass ~32 ms/query; warm serial **3.3 ms avg /
+4.4 ms p99**; peak **~2,800 QPS at C20**, flat to C140; **recall 0.8408**; device at
+~584K IOPS / 100 % util.
+
+Use `--quantization NOQUANT` with a separate `--logdir` for the NOQUANT comparison, and drop
+`--storage-tier` / `FLUSHANDEVICT` for the in-memory numbers.

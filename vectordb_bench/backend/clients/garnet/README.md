@@ -320,19 +320,30 @@ vectors are evicted). Unlike the streaming case it uses the static
 | `Q8` | 8-bit quantized (768 B) | kept | 768 B |
 | `BIN` | 1-bit (96 B) | kept | 96 B |
 
-Q8/BIN keep the compact quantized vector memory-resident for graph traversal and
-keep the raw FP32 for final reranking. Under storage tiering, Garnet's read policy
-**copies the quantized + adjacency "stub" records back into memory** (main-log
-tail; no read cache required) when they are read from disk, while the raw FP32 is
-served from disk. So a disk-tiered Q8/BIN graph traverses on memory-resident
-quantized vectors and only reads raw FP32 from disk for reranking.
+Vectors are always **ingested as FP32** (`VADD <set> FP32 <bytes> ...`); the mode
+only selects what is stored alongside them. Q8/BIN keep the compact quantized vector
+memory-resident for graph traversal and keep the raw FP32 for final reranking.
+
+Under storage tiering, Garnet applies a **per-namespace read-copy policy**: on a disk
+read, a record is either copied back into memory (copy-to-tail on the main log — or
+into the read cache when `--read-cache` is enabled) or served from disk every time:
+
+| Copied back to memory | Served from disk |
+| --- | --- |
+| QuantizedVector, NeighborList (adjacency), Metadata, InternalIdMap, ExternalIdMap | **FullVector** (raw FP32, rerank only), Attributes (filtered search only) |
+
+So a disk-tiered Q8/BIN graph **traverses entirely on memory-resident quantized
+vectors** and reads raw FP32 from disk only to rerank the final candidate set.
 
 **What to expect** (10M Cohere, `M=16, l_build=300, l_search=192, k=100`, on the
 hardware in BENCHMARK_RESULTS.md): in memory, Q8 roughly **doubles** peak QPS vs
 NOQUANT at equal recall (cheaper 768 B distance computations). Served from disk,
-recall is preserved and the quantized vectors are confirmed resident, but per-query
-latency is currently dominated by the raw-FP32 disk reads — see the *reads/query*
-step below.
+recall is identical (0.8408) and Q8 now reaches **3.3 ms serial latency** — close to
+the ~2.7 ms in-memory figure — issuing **~193 FP32 rerank reads/query**
+(`max(k, l_search)`). Peak disk QPS (~2,800) is bounded by the NVMe's IOPS ceiling,
+not by software. See
+[BENCHMARK_RESULTS.md](./BENCHMARK_RESULTS.md#the-q8-disk-tiered-optimization-arc)
+for the full 86 ms -> 3.3 ms optimization history.
 
 ### Step A — Start a disk-tiered server (native O_DIRECT)
 
@@ -348,7 +359,7 @@ dotnet ~/git/garnet/main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
   --port 6379 --bind 127.0.0.1 --enable-vector-set-preview \
   --index 2g --memory 64g --page 64m \
   --storage-tier --logdir "$LOGDIR" --checkpointdir "$LOGDIR" \
-  --device-type Native --device-io-backend Libaio --device-completion-threads 16 \
+  --device-type Native --device-io-backend Uring \
   --enable-debug-command local
 ```
 
@@ -362,9 +373,22 @@ keys Q8/BIN add.
 | --- | --- |
 | `--storage-tier` + `--logdir` | Enable the on-disk tier the raw vectors are evicted to. |
 | `--device-type Native` | Linux O_DIRECT device — bypasses the OS page cache so disk numbers are real. |
-| `--device-io-backend Libaio` | libaio backend (`Uring` also available). |
-| `--device-completion-threads 16` | IO-completion threads for the device. |
+| `--device-io-backend Uring` | io_uring backend (`Libaio` also available; both plateau at the same device-bound QPS). |
 | `--enable-debug-command local` | Enables `DEBUG FLUSHANDEVICT` (loopback only). |
+
+**Device tuning is no longer needed.** Since garnet
+[#2018](https://github.com/microsoft/garnet/pull/2018) the Native device defaults
+(ring sharding, `--device-throttle-limit` 4096, 4 completion threads) match or beat
+the previously hand-tuned settings, so the flags below are optional:
+
+| Optional flag | Effect |
+| --- | --- |
+| `--device-uring-sqpoll` | io_uring **SQPOLL**: a kernel thread polls the submission queue, so submits are syscall-free. **Cuts serial latency ~19 %** (4.1 -> 3.3 ms) and helps low concurrency (+15 % QPS at C10), but does **not** raise peak QPS (device-bound) and costs a little p99 at high concurrency, since each ring gets a busy-polling thread. Opt-in; `Uring` backend only. |
+| `--device-uring-sqpoll-idle-ms` | SQPOLL poll-thread idle window (`sq_thread_idle`) before parking. `0` = native default (10 s). |
+| `--device-io-contexts` | Number of io_uring rings / libaio io_contexts. Defaults to `min(2 x cores, 64)`. Set at or above submitter concurrency so each submitter owns a ring. |
+| `--device-queue-depth` | Per-ring kernel submission depth. `0` = device default. |
+| `--device-throttle-limit` | Per-device max in-flight IOs (default 4096 for Native). Lowering it to 512 changed nothing measurable here. |
+| `--device-completion-threads` | IO-completion drain threads (default 4). Raising it had no effect once the device was saturated. |
 
 ### Step B — Load (32 insert workers)
 
@@ -460,8 +484,25 @@ python3 -c "print('reads/query ~ %.0f' % (sum(float(l.split()[1])*2 for l in ope
 ```
 
 `r/s` is column 2 of `iostat -x`; `rareq-sz` (column 7) is the average read size.
-`reads/query` scales with `--l-search` (the candidate/visited set), which is the
-main knob for the disk read volume.
+
+**What to expect.** Only the raw FP32 vectors are read from disk, once per rerank
+candidate, so:
+
+> **reads/query = max(`--k`, `--l-search`)** — e.g. **~193** at `l_search=192, k=100`,
+> and ~101 at `l_search` 32 or 64 (where `k=100` dominates).
+
+`rareq-sz` should be **~3.4 KB**, i.e. the 3,072 B vector plus framing fetched in a
+**single** device read. A larger value, or roughly double the expected read count,
+means a record is being split across two IOs or an extra namespace is being served
+from disk — that is exactly how the uncached-`Metadata` bug was found (386 reads/query
+instead of 193; see
+[BENCHMARK_RESULTS.md](./BENCHMARK_RESULTS.md#phase-1--the-metadata-discovery)).
+
+Since disk throughput is device-IOPS-bound, this count sets the ceiling directly:
+
+> **peak_QPS ~= device_IOPS_ceiling / reads_per_query**
+
+so `--l-search` is the main knob trading recall against disk QPS.
 
 ### Step G — Checkpoint & recover (skip the reload)
 
@@ -477,7 +518,7 @@ dotnet ~/git/garnet/main/GarnetServer/bin/Release/net10.0/GarnetServer.dll \
   --port 6379 --bind 127.0.0.1 --enable-vector-set-preview \
   --index 2g --memory 64g --page 64m \
   --storage-tier --logdir "$LOGDIR" --checkpointdir "$LOGDIR" \
-  --device-type Native --device-io-backend Libaio --device-completion-threads 16 \
+  --device-type Native --device-io-backend Uring \
   --enable-debug-command local --recover
 ```
 
@@ -556,6 +597,13 @@ Key fields for judging index health:
   the raw FP32 stays available for reranking, and roughly doubles in-memory search
   throughput at equal recall (see
   [the quantized benchmark](#quantized-in-memory-vs-disk-tiered-benchmark-static-load)).
+- **Disk-tiered serving is device-IOPS-bound**, not CPU- or tuning-bound. With Q8 the
+  only disk traffic is `max(k, l_search)` FP32 rerank reads per query, so
+  `peak_QPS ~= device_IOPS / reads_per_query`. The Native device defaults are good as
+  shipped; the one flag worth opting into is **`--device-uring-sqpoll`** (~19 % lower
+  serial latency, no change to peak QPS). To go faster, cut reads per query (lower
+  `--l-search`) or add NVMe devices — not more IO tuning. See
+  [BENCHMARK_RESULTS.md](./BENCHMARK_RESULTS.md#device-saturation-analysis).
 - **Smaller smoke test:** swap `--dataset-with-size-type "Medium Cohere (768dim, 1M)"`,
   `--memory 16g --index 2g`, and lower `--search-stages` for a quick end-to-end
   validation.
